@@ -1,0 +1,147 @@
+
+name: Pack Pixel 5 Boot Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful kernel build Run ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  pack:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    env:
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      PROFILE: redfin-up1a-231105-001-b2
+      FACTORY_URL: https://dl.google.com/dl/android/aosp/redfin-up1a.231105.001.b2-factory-4e5a2679.zip
+      FACTORY_SHA256: 4e5a26793d8400f13b72cbd17aeb284e040b3236436f0c6f3119ccc77d4495ad
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lz4 openssl unzip curl
+
+      - name: Test tooling
+        run: |
+          python3 -m compileall -q tools tests
+          python3 -m unittest discover -s tests -v
+
+      - name: Download verified build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+
+          RUN_API="repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID"
+
+          test "$(gh api "$RUN_API" --jq '.conclusion')" = success
+          test "$(gh api "$RUN_API" --jq '.path')" = .github/workflows/build.yml
+
+          RUN_NUMBER=$(gh api "$RUN_API" --jq '.run_number')
+          ARTIFACT_NAME="pixel5-${PROFILE}-${RUN_NUMBER}"
+
+          gh run download "$BUILD_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" \
+            --dir kernel-artifact
+
+      - name: Verify kernel artifact
+        working-directory: kernel-artifact
+        run: sha256sum -c SHA256SUMS.txt
+
+      - name: Download official factory image
+        run: |
+          curl --fail --location \
+            --proto '=https' \
+            --retry 3 \
+            "$FACTORY_URL" \
+            --output factory.zip
+
+          echo "$FACTORY_SHA256  factory.zip" | sha256sum -c -
+
+      - name: Extract stock images
+        run: |
+          mkdir stock
+
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          from pathlib import Path
+          import shutil
+
+          with ZipFile("factory.zip") as outer:
+              names = [
+                  n for n in outer.namelist()
+                  if n.endswith(
+                      "/image-redfin-up1a.231105.001.b2.zip"
+                  )
+              ]
+              if len(names) != 1:
+                  raise ValueError("Unexpected factory archive")
+
+              with outer.open(names[0]) as src:
+                  with open("factory-inner.zip", "wb") as dst:
+                      shutil.copyfileobj(src, dst)
+
+          with ZipFile("factory-inner.zip") as inner:
+              for name in ("boot.img", "vendor_boot.img"):
+                  with inner.open(name) as src:
+                      with open(Path("stock") / ("stock-" + name), "wb") as dst:
+                          shutil.copyfileobj(src, dst)
+          PY
+
+      - name: Pack and validate boot image
+        run: |
+          python3 tools/pack_boot.py \
+            --profile "$PROFILE" \
+            --stock-dir stock \
+            --artifact-dir kernel-artifact \
+            --output-dir packed
+
+      - name: Prepare recovery files
+        run: |
+          cp stock/stock-boot.img packed/
+          cp kernel-artifact/build-info.json packed/
+          cp kernel-artifact/abi-report.json packed/
+
+          printf '%s\n' \
+            'Device: Pixel 5 redfin' \
+            'Firmware: UP1A.231105.001.B2' \
+            'Unlocked bootloader required.' \
+            'Back up data and test temporary boot first.' \
+            'Do not relock with a modified boot image.' \
+            'Hardware validation has not been performed by CI.' \
+            > packed/README-FLASH.txt
+
+          cd packed
+          sha256sum *.img *.json README-FLASH.txt > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload packed boot image
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: pixel5-packed-${{ github.run_number }}
+          path: packed/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
